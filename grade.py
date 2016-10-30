@@ -14,6 +14,7 @@ import re
 import shutil
 import tarfile
 import zipfile
+from difflib import unified_diff
 
 from subprocess import check_output, STDOUT, CalledProcessError, TimeoutExpired
 
@@ -23,30 +24,17 @@ SUBS_DIR = 'submissions'
 RUN_DIR = 'run'
 
 # Name strings for student files
-INFO_FILE = '{0}.info.txt'  # Blackboard info file
-OUTPUT_FILE = '{0}.out.txt'
-GRADING_FILE = '{0}.grading.txt'
+INFO_FILE = 'info-{0}.txt'
+OUTPUT_FILE = 'out-{0}.txt'
+GRADING_FILE = 'grading-{0}.txt'
+DIFF_FILE = 'diff-{0}.diff'
+PRINT_FILE = 'prints-{0}.txt'
 
 # REs to identity and rename things
 INFO_FILE_RE = re.compile(r'.+_attempt_[0-9-]{19}\.txt')
 STUDENT_ID_RE = re.compile(r'^Name:.+\((.+)\)$')
 ORIG_FILE_RE = re.compile(r'^\tOriginal filename: (.+)$')
 FILE_RE = re.compile(r'^\tFilename: (.+)$')
-
-
-class ReadableDirectory(argparse.Action):
-    """Action class for ArgumentParser to validate a readable directory from the command line."""
-
-    def __call__(self, parser, namespace, values, option_string=None):
-        prospective_dir = values
-
-        if not os.path.isdir(prospective_dir):
-            raise argparse.ArgumentTypeError('{0} is not a valid path'.format(prospective_dir))
-
-        if os.access(prospective_dir, os.R_OK):
-            setattr(namespace, self.dest, prospective_dir)
-        else:
-            raise argparse.ArgumentTypeError('{0} is not a readable dir'.format(prospective_dir))
 
 
 def glob_commands_txt(path):
@@ -76,17 +64,30 @@ def process_args():
 
     parser = argparse.ArgumentParser(description='Setup grading directories and run assignments for CS 1713.')
 
-    parser.add_argument('assignment', help='The name of the assignment.')
-    parser.add_argument('grader', help='The name of the grader.')
+    parser.add_argument('grader', help='String to use for grader info.')
 
     parser.add_argument('-d', '--directory', default='.', help='The directory you want to grade in.')
     parser.add_argument('-z', '--zipfile', default="blackboard.zip", help='The zipfile from Blackboard.')
     parser.add_argument('-r', '--resources', default='resources',
-                        help='The directory with the default resources needed to run the assignment.')
+                        help='Directory with the default resources needed to run the assignment.')
     parser.add_argument('-c', '--commands', default='commands.txt',
-                        help='File with commands to run for each submission, separated by newlines.')
+                        help='Text file with line separated commands to run.')
+    parser.add_argument('-o', '--output', default='output.txt', help='File with correct output.')
 
     return parser.parse_args()
+
+
+def condense_spaces(raw):
+    parsed = []
+
+    for line in raw:
+        line = re.sub(r'\s+', ' ', line)
+        line = re.sub(r'^\s?', '', line)
+        line = re.sub(r'\s$', '\n', line)
+
+        parsed.append(line)
+
+    return parsed
 
 
 def run():
@@ -96,19 +97,21 @@ def run():
 
     work_path = os.path.abspath(args.directory)
     res_path = os.path.abspath(args.resources)
-    commands_path = os.path.abspath(args.commands)
+    cmd_file = os.path.abspath(args.commands)
+    correct = open(args.output).readlines()
+    correct = condense_spaces(correct)
+
+    grader = args.grader
 
     os.chdir(work_path)
     archive = zipfile.ZipFile(args.zipfile, 'r')
-    assignment = args.assignment
-    grader = args.grader
 
     # Make top-level directories
     if os.path.exists(TEMP_DIR):
-        raise Exception('{0} directory already exists'.format(TEMP_DIR))
+        shutil.rmtree(TEMP_DIR)
     os.mkdir(TEMP_DIR)
     if os.path.exists(SUBS_DIR):
-        raise Exception('{0} directory already exists'.format(SUBS_DIR))
+        shutil.rmtree(SUBS_DIR)
     os.mkdir(SUBS_DIR)
 
     # Extract the zipfile to temp directory
@@ -155,8 +158,6 @@ def run():
             name, extension = os.path.splitext(file_name)
 
             if extension in ('.zip', '.tar', '.gz'):
-                print('Extracting archive ({0}): {1}'.format(student_id, file_name))
-
                 if extension == '.zip':
                     archive = zipfile.ZipFile(file_name, 'r')
                 elif extension == '.tar':
@@ -173,53 +174,76 @@ def run():
                         os.rename(os.path.join(name, unzip_file), unzip_file)
                     shutil.rmtree(name)
 
-        # Move C and Makefile's into a temp directory to run
+        # Copy student's files and default resources into temp directory
+        # Look for print or write statements to check for cheating
         os.mkdir(os.path.join(work_path, TEMP_DIR, RUN_DIR))
+        os.chdir(os.path.join(work_path, SUBS_DIR, student_id))
+        print_file = open(PRINT_FILE.format(student_id), 'w')
         for file_name in os.listdir('.'):
             if file_name.endswith('.c') or file_name == 'Makefile':
+                with open(file_name) as f:
+                    print_file.writelines(print_check(f.readlines()))
                 shutil.copy(file_name, os.path.join(work_path, TEMP_DIR, RUN_DIR))
 
-        # Generate a template grading.txt file
-        grading_file = open(os.path.join(GRADING_FILE.format(student_id)), 'w')
-        grading_file.write('Grading for {0} ({1}).\n\n'.format(assignment, student_id))
+        for res_file_name in os.listdir(res_path):
+            shutil.copy(os.path.join(res_path, res_file_name), os.path.join(work_path, TEMP_DIR, RUN_DIR))
 
         # Run the student's submission in 'temp/run' and save the output in their abc123 directory
-        os.chdir(os.path.join(work_path, TEMP_DIR, RUN_DIR))
-        for res_file_name in os.listdir(res_path):
-            shutil.copy(os.path.join(res_path, res_file_name), '.')
+        run_submission(correct, cmd_file, grader, student_id, work_path)
 
-        commands = glob_commands_txt(commands_path)
-        output = []
-        for cmd in commands:
-            try:
-                output.append(str(check_output(cmd, stderr=STDOUT, timeout=10), 'utf-8'))
-            except (CalledProcessError, FileNotFoundError, TimeoutExpired) as err:
-                print('Compile or run error ({0}):  {1}'.format(student_id, cmd))
-                grading_file.write('* Compile or run error: {0}\n'.format(cmd))
-                output.append('* Compile or run error: {0}\n'.format(cmd))
-                if isinstance(err, CalledProcessError):
-                    output.append(str(err.output, 'utf-8'))
-                if isinstance(err, TimeoutExpired):
-                    grading_file.write('* Command timed out\n')
-                    output.append('* Command timed out\n')
-                if isinstance(err, FileNotFoundError):
-                    grading_file.write('* File not found\n')
-                    output.append('* File not found\n')
-
-        output_file = open(os.path.join(work_path, SUBS_DIR, student_id, OUTPUT_FILE.format(student_id)), 'w')
-        output_file.writelines(output)
-
-        grading_file.write('\n')
-        grading_file.write('Score: \n')
-        grading_file.write('Grader: {0}\n'.format(grader))
-
-        grading_file.close()
-        output_file.close()
         os.chdir(work_path)
         shutil.rmtree(os.path.join(TEMP_DIR, RUN_DIR))
         # End of submission running
 
     shutil.rmtree(TEMP_DIR)
+
+
+def print_check(raw):
+    matches = []
+
+    for line in raw:
+        match = re.match(r'.+(printf|write) *\(.+', line)
+        if match:
+            matches += line
+
+    return matches
+
+
+def run_submission(correct, cmd_file, grader, student_id, work_path):
+    # Open output and grading text files
+    os.chdir(os.path.join(work_path, SUBS_DIR, student_id))
+    grading_file = open(GRADING_FILE.format(student_id), 'w')
+    out_file = open(OUTPUT_FILE.format(student_id), 'w')
+    diff_file = open(DIFF_FILE.format(student_id), 'w')
+
+    print('Assignment 2 ({0})'.format(student_id), file=grading_file)
+    os.chdir(os.path.join(work_path, TEMP_DIR, RUN_DIR))
+    commands = glob_commands_txt(cmd_file)
+    output = []
+    success = True
+    for cmd in commands:
+        try:
+            output += check_output(cmd, stderr=STDOUT, timeout=5, universal_newlines=True).splitlines(keepends=True)
+        except (CalledProcessError, FileNotFoundError, TimeoutExpired) as err:
+            print("* Doesn't compile, doesn't run, or has significant issues", file=grading_file)
+            print("* Failed for command: {0}".format(' '.join(cmd)), file=grading_file)
+            if isinstance(err, CalledProcessError):
+                print(str(err.output), file=grading_file)
+            if isinstance(err, TimeoutExpired):
+                print("* Command timed out", file=grading_file)
+            if isinstance(err, FileNotFoundError):
+                print("* File not found", file=grading_file)
+            success = False
+            break
+
+    if success:
+        print(''.join(output), file=out_file)
+        output = condense_spaces(output)
+        diff_file.writelines(unified_diff(correct, output, fromfile='correct', tofile='student'))
+
+    print('', file=grading_file)
+    print('Score: ', file=grading_file)
+    print('Grader: {0}'.format(grader), file=grading_file)
 
 
 if __name__ == '__main__':
