@@ -74,6 +74,8 @@ def process_args():
                         help='Text file with line separated commands to run.')
     parser.add_argument('-o', '--output', default='output.txt', help='File with correct output.')
 
+    parser.add_argument('-R', '--regrade', help='File of Student IDs to regrade.', default=None)
+
     return parser.parse_args()
 
 
@@ -90,7 +92,100 @@ def condense_spaces(raw):
     return parsed
 
 
-def run():
+def print_check(raw):
+    matches = []
+
+    for line in raw:
+        match = re.match(r'.+(printf|write) *\(.+', line)
+        if match:
+            matches += line
+
+    return matches
+
+
+def regrade(correct, cmd_file, grader, student_id, res_path):
+    files = []
+    files += OUTPUT_FILE.format(student_id)
+    files += GRADING_FILE.format(student_id)
+    files += DIFF_FILE.format(student_id)
+    files += GRADING_FILE.format(student_id)
+    for file in files:
+        if os.path.exists(file):
+            os.remove(file)
+
+    os.chdir(os.path.join(SUBS_DIR, student_id))
+    run(correct, cmd_file, grader, student_id, res_path)
+
+
+def run(correct, cmd_file, grader, student_id, res_path):
+    """Prepares a temp directory to run code in, globs the commands, compiles, runs, and generates output files."""
+
+    # Going to run submission in temp subdirectory
+    if os.path.exists(TEMP_DIR):
+        shutil.rmtree(TEMP_DIR)
+    os.mkdir(TEMP_DIR)
+
+    # Open analysis files
+    grading_file = open(GRADING_FILE.format(student_id), 'w')
+    out_file = open(OUTPUT_FILE.format(student_id), 'w')
+    diff_file = open(DIFF_FILE.format(student_id), 'w')
+    print_file = open(PRINT_FILE.format(student_id), 'w')
+
+    # Copy default resources into temp directory
+    for res_file_name in os.listdir(res_path):
+        shutil.copy(os.path.join(res_path, res_file_name), os.path.join(TEMP_DIR, res_file_name))
+
+    # Copy student resources into temp directory
+    files = (file for file in os.listdir('.') if os.path.isfile(file))
+    for file in files:
+        shutil.copy(file, os.path.join(TEMP_DIR, file))
+        if file.endswith('.c'):
+            with open(file) as f:
+                try:
+                  print_file.writelines(print_check(f.readlines()))
+                except UnicodeDecodeError as err:
+                  print("* Failed to parse source code", file=grading_file)
+                  return
+
+    os.chdir(TEMP_DIR)
+
+    # Need to get absolute path for binary file
+    commands = glob_commands_txt(cmd_file)
+
+    print('Assignment 2 ({0})'.format(student_id), file=grading_file)
+
+    output = []
+    success = True
+    for cmd in commands:
+        try:
+            output += check_output(cmd, stderr=STDOUT, timeout=5, universal_newlines=True).splitlines(keepends=True)
+        except Exception as err:
+            print("* Failed for command: {0}".format(' '.join(cmd)), file=grading_file)
+            if isinstance(err, CalledProcessError):
+                print(str(err.output), file=grading_file)
+            elif isinstance(err, TimeoutExpired):
+                print("* Command timed out", file=grading_file)
+            elif isinstance(err, FileNotFoundError):
+                print("* File not found", file=grading_file)
+            else:
+                print("* Didn't match expected exception types", file=grading_file)
+            success = False
+            break
+
+    if success:
+        print(''.join(output), file=out_file)
+        output = condense_spaces(output)
+        diff_file.writelines(unified_diff(correct, output, fromfile='correct', tofile='student'))
+
+    print('', file=grading_file)
+    print('Score: ', file=grading_file)
+    print('Grader: {0}'.format(grader), file=grading_file)
+
+    os.chdir('..')
+    shutil.rmtree(TEMP_DIR)
+
+
+def main():
     """Unzip file from Blackboard, create student directories, rename files, and run commands.txt for each."""
 
     args = process_args()
@@ -102,14 +197,23 @@ def run():
     correct = condense_spaces(correct)
 
     grader = args.grader
+    regrade_file = args.regrade
 
     os.chdir(work_path)
+
+    if regrade_file:
+        regrade_file = open(regrade_file)
+        for student_id in regrade_file.read().splitlines():
+            if not os.path.exists(os.path.join(SUBS_DIR, student_id)):
+                raise Exception("Student directory ({0}) does not exist".format(student_id))
+            os.chdir(os.path.join(SUBS_DIR, student_id))
+            run(correct, cmd_file, grader, student_id, res_path)
+            os.chdir(work_path)
+        return
+
     archive = zipfile.ZipFile(args.zipfile, 'r')
 
     # Make top-level directories
-    if os.path.exists(TEMP_DIR):
-        shutil.rmtree(TEMP_DIR)
-    os.mkdir(TEMP_DIR)
     if os.path.exists(SUBS_DIR):
         shutil.rmtree(SUBS_DIR)
     os.mkdir(SUBS_DIR)
@@ -174,77 +278,11 @@ def run():
                         os.rename(os.path.join(name, unzip_file), unzip_file)
                     shutil.rmtree(name)
 
-        # Copy student's files and default resources into temp directory
-        # Look for print or write statements to check for cheating
-        os.mkdir(os.path.join(work_path, TEMP_DIR, RUN_DIR))
-        os.chdir(os.path.join(work_path, SUBS_DIR, student_id))
-        print_file = open(PRINT_FILE.format(student_id), 'w')
-        for file_name in os.listdir('.'):
-            if file_name.endswith('.c') or file_name == 'Makefile':
-                with open(file_name) as f:
-                    print_file.writelines(print_check(f.readlines()))
-                shutil.copy(file_name, os.path.join(work_path, TEMP_DIR, RUN_DIR))
-
-        for res_file_name in os.listdir(res_path):
-            shutil.copy(os.path.join(res_path, res_file_name), os.path.join(work_path, TEMP_DIR, RUN_DIR))
-
         # Run the student's submission in 'temp/run' and save the output in their abc123 directory
-        run_submission(correct, cmd_file, grader, student_id, work_path)
+        run(correct, cmd_file, grader, student_id, res_path)
 
         os.chdir(work_path)
-        shutil.rmtree(os.path.join(TEMP_DIR, RUN_DIR))
-        # End of submission running
-
-    shutil.rmtree(TEMP_DIR)
-
-
-def print_check(raw):
-    matches = []
-
-    for line in raw:
-        match = re.match(r'.+(printf|write) *\(.+', line)
-        if match:
-            matches += line
-
-    return matches
-
-
-def run_submission(correct, cmd_file, grader, student_id, work_path):
-    # Open output and grading text files
-    os.chdir(os.path.join(work_path, SUBS_DIR, student_id))
-    grading_file = open(GRADING_FILE.format(student_id), 'w')
-    out_file = open(OUTPUT_FILE.format(student_id), 'w')
-    diff_file = open(DIFF_FILE.format(student_id), 'w')
-
-    print('Assignment 2 ({0})'.format(student_id), file=grading_file)
-    os.chdir(os.path.join(work_path, TEMP_DIR, RUN_DIR))
-    commands = glob_commands_txt(cmd_file)
-    output = []
-    success = True
-    for cmd in commands:
-        try:
-            output += check_output(cmd, stderr=STDOUT, timeout=5, universal_newlines=True).splitlines(keepends=True)
-        except (CalledProcessError, FileNotFoundError, TimeoutExpired) as err:
-            print("* Doesn't compile, doesn't run, or has significant issues", file=grading_file)
-            print("* Failed for command: {0}".format(' '.join(cmd)), file=grading_file)
-            if isinstance(err, CalledProcessError):
-                print(str(err.output), file=grading_file)
-            if isinstance(err, TimeoutExpired):
-                print("* Command timed out", file=grading_file)
-            if isinstance(err, FileNotFoundError):
-                print("* File not found", file=grading_file)
-            success = False
-            break
-
-    if success:
-        print(''.join(output), file=out_file)
-        output = condense_spaces(output)
-        diff_file.writelines(unified_diff(correct, output, fromfile='correct', tofile='student'))
-
-    print('', file=grading_file)
-    print('Score: ', file=grading_file)
-    print('Grader: {0}'.format(grader), file=grading_file)
 
 
 if __name__ == '__main__':
-    run()
+    main()
