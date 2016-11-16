@@ -1,9 +1,9 @@
 #!/usr/bin/python3
 
-"""Script to help automate grading programming assignments submitted to Blackboard.
+"""Helps automate grading programming assignments submitted to Blackboard.
 
-Setup for UTSA CS 1713, Intro to Programming 2, which teaches simple C programming.
-Takes a zipfile generated from the web interface and creates individual directories for students.
+Setup for UTSA CS 1713, which teaches simple C programming.
+Takes a zipfile generated from the web GUI and creates students directories.
 For each student it runs their C program and saves the output.
 """
 
@@ -29,6 +29,7 @@ OUTPUT_FILE = 'out-{0}.txt'
 GRADING_FILE = 'grading-{0}.txt'
 DIFF_FILE = 'diff-{0}.diff'
 PRINT_FILE = 'prints-{0}.txt'
+COND_CORR_FILE = 'condensed_output.txt'
 
 # REs to identity and rename things
 INFO_FILE_RE = re.compile(r'.+_attempt_[0-9-]{19}\.txt')
@@ -38,7 +39,7 @@ FILE_RE = re.compile(r'^\tFilename: (.+)$')
 
 
 def glob_commands_txt(path):
-    """Globs the tokens in commands.txt file. Use glob to handle wildcards without actually using a shell."""
+    """Globs the tokens in commands.txt without using a shell."""
 
     file = open(path)
     lines = file.readlines()
@@ -62,19 +63,25 @@ def glob_commands_txt(path):
 def process_args():
     """Process the command line args."""
 
-    parser = argparse.ArgumentParser(description='Setup grading directories and run assignments for CS 1713.')
+    parser = argparse.ArgumentParser(
+        description='Help automate grading for CS 1713.'
+    )
 
     parser.add_argument('grader', help='String to use for grader info.')
 
-    parser.add_argument('-d', '--directory', default='.', help='The directory you want to grade in.')
-    parser.add_argument('-z', '--zipfile', default="blackboard.zip", help='The zipfile from Blackboard.')
+    parser.add_argument('-d', '--directory', default='.',
+                        help='The directory you want to grade in.')
+    parser.add_argument('-z', '--zipfile', default="blackboard.zip",
+                        help='The zipfile from Blackboard.')
     parser.add_argument('-r', '--resources', default='resources',
-                        help='Directory with the default resources needed to run the assignment.')
+                        help='Directory with resources to compile assignment.')
     parser.add_argument('-c', '--commands', default='commands.txt',
                         help='Text file with line separated commands to run.')
-    parser.add_argument('-o', '--output', default='output.txt', help='File with correct output.')
+    parser.add_argument('-o', '--output', default='output.txt',
+                        help='File with correct output.')
 
-    parser.add_argument('-R', '--regrade', help='File of Student IDs to regrade.', default=None)
+    parser.add_argument('-R', '--regrade',
+                        help='File of Student IDs to regrade.', default=None)
 
     return parser.parse_args()
 
@@ -83,11 +90,12 @@ def condense_spaces(raw):
     parsed = []
 
     for line in raw:
-        line = re.sub(r'\s+', ' ', line)
-        line = re.sub(r'^\s?', '', line)
-        line = re.sub(r'\s$', '\n', line)
+        line = re.sub(r'^\s+', '', line)
+        line = re.sub(r'\s+$', '\n', line)
+        line = re.sub(r'\s{2,}', ' ', line)
 
-        parsed.append(line)
+        if line != '':
+            parsed.append(line)
 
     return parsed
 
@@ -118,7 +126,7 @@ def regrade(correct, cmd_file, grader, student_id, res_path):
 
 
 def run(correct, cmd_file, grader, student_id, res_path):
-    """Prepares a temp directory to run code in, globs the commands, compiles, runs, and generates output files."""
+    """Compiles and runs code in temp directory."""
 
     # Going to run submission in temp subdirectory
     if os.path.exists(TEMP_DIR):
@@ -133,7 +141,10 @@ def run(correct, cmd_file, grader, student_id, res_path):
 
     # Copy default resources into temp directory
     for res_file_name in os.listdir(res_path):
-        shutil.copy(os.path.join(res_path, res_file_name), os.path.join(TEMP_DIR, res_file_name))
+        shutil.copy(
+            os.path.join(res_path, res_file_name),
+            os.path.join(TEMP_DIR, res_file_name)
+        )
 
     # Copy student resources into temp directory
     files = (file for file in os.listdir('.') if os.path.isfile(file))
@@ -142,10 +153,10 @@ def run(correct, cmd_file, grader, student_id, res_path):
         if file.endswith('.c'):
             with open(file) as f:
                 try:
-                  print_file.writelines(print_check(f.readlines()))
+                    print_file.writelines(print_check(f.readlines()))
                 except UnicodeDecodeError as err:
-                  print("* Failed to parse source code", file=grading_file)
-                  return
+                    print("* Failed to parse source code", file=grading_file)
+                    return
 
     os.chdir(TEMP_DIR)
 
@@ -158,9 +169,12 @@ def run(correct, cmd_file, grader, student_id, res_path):
     success = True
     for cmd in commands:
         try:
-            output += check_output(cmd, stderr=STDOUT, timeout=5, universal_newlines=True).splitlines(keepends=True)
+            cmd_output = check_output(cmd, stderr=STDOUT, timeout=5,
+                                      universal_newlines=True)
+            output += cmd_output.splitlines(keepends=True)
         except Exception as err:
-            print("* Failed for command: {0}".format(' '.join(cmd)), file=grading_file)
+            print("* Failed for command: {0}".format(' '.join(cmd)),
+                  file=grading_file)
             if isinstance(err, CalledProcessError):
                 print(str(err.output), file=grading_file)
             elif isinstance(err, TimeoutExpired):
@@ -168,14 +182,19 @@ def run(correct, cmd_file, grader, student_id, res_path):
             elif isinstance(err, FileNotFoundError):
                 print("* File not found", file=grading_file)
             else:
-                print("* Didn't match expected exception types", file=grading_file)
+                print("* Didn't match expected exception types",
+                      file=grading_file)
             success = False
             break
 
     if success:
-        print(''.join(output), file=out_file)
         output = condense_spaces(output)
-        diff_file.writelines(unified_diff(correct, output, fromfile='correct', tofile='student'))
+        out_file.writelines(output)
+        diff = unified_diff(
+            correct, output,
+            fromfile='correct', tofile='student'
+        )
+        diff_file.writelines(diff)
 
     print('', file=grading_file)
     print('Score: ', file=grading_file)
@@ -186,15 +205,25 @@ def run(correct, cmd_file, grader, student_id, res_path):
 
 
 def main():
-    """Unzip file from Blackboard, create student directories, rename files, and run commands.txt for each."""
+    """
+    1. Unzip file from Blackboard
+    2. Create student directories
+    3. Rename files
+    4. Run commands.txt
+    """
 
     args = process_args()
 
     work_path = os.path.abspath(args.directory)
     res_path = os.path.abspath(args.resources)
     cmd_file = os.path.abspath(args.commands)
-    correct = open(args.output).readlines()
-    correct = condense_spaces(correct)
+
+    with open(args.output) as f:
+        corr_out = f.readlines()
+        corr_out = condense_spaces(corr_out)
+
+    with open(COND_CORR_FILE, 'w') as f:
+        f.writelines(corr_out)
 
     grader = args.grader
     regrade_file = args.regrade
@@ -205,9 +234,11 @@ def main():
         regrade_file = open(regrade_file)
         for student_id in regrade_file.read().splitlines():
             if not os.path.exists(os.path.join(SUBS_DIR, student_id)):
-                raise Exception("Student directory ({0}) does not exist".format(student_id))
+                raise Exception(
+                    "Student directory ({0}) does not exist".format(student_id)
+                )
             os.chdir(os.path.join(SUBS_DIR, student_id))
-            run(correct, cmd_file, grader, student_id, res_path)
+            run(corr_out, cmd_file, grader, student_id, res_path)
             os.chdir(work_path)
         return
 
@@ -222,15 +253,19 @@ def main():
     archive.extractall(TEMP_DIR)
     archive.close()
 
-    # Traverse temp directory, looking for submission info file, then process each of those
+    # Traverse temp directory, looking for submission info files to process
     for raw_file_name in os.listdir(TEMP_DIR):
         re_match = INFO_FILE_RE.search(raw_file_name)
 
         if not re_match:
             continue
 
-        # Process the info file which maps user actual submissions to Blackboard's ugly zipfile names
-        with open(os.path.join(TEMP_DIR, raw_file_name)) as info_file:
+        # Process the info file
+        # Info file maps actual submissions to Blackboard's ugly zipfile names
+        with open(
+            os.path.join(TEMP_DIR, raw_file_name),
+            encoding='utf-8'
+        ) as info_file:
             student_id = None
             orig_file_name = None
 
@@ -240,7 +275,8 @@ def main():
                 if re_match:
                     student_id = re_match.group(1)
                     os.mkdir(os.path.join(SUBS_DIR, student_id))
-                    os.rename(info_file.name, os.path.join(SUBS_DIR, student_id, INFO_FILE.format(student_id)))
+                    os.rename(info_file.name, os.path.join(
+                        SUBS_DIR, student_id, INFO_FILE.format(student_id)))
                     continue
 
                 # Line with an original filename (as the student submitted)
@@ -249,11 +285,14 @@ def main():
                     orig_file_name = re_match.group(1)
                     continue
 
-                # Line with the filename as it is in the zipfile, here we actually rename the files
+                # Line with the filename as it is in the zipfile
                 re_match = FILE_RE.search(line)
                 if re_match:
                     raw_file_name = re_match.group(1)
-                    os.rename(os.path.join(TEMP_DIR, raw_file_name), os.path.join(SUBS_DIR, student_id, orig_file_name))
+                    os.rename(
+                        os.path.join(TEMP_DIR, raw_file_name),
+                        os.path.join(SUBS_DIR, student_id, orig_file_name)
+                    )
                     continue
 
         # Uncompress archive files if any
@@ -278,8 +317,8 @@ def main():
                         os.rename(os.path.join(name, unzip_file), unzip_file)
                     shutil.rmtree(name)
 
-        # Run the student's submission in 'temp/run' and save the output in their abc123 directory
-        run(correct, cmd_file, grader, student_id, res_path)
+        # Run submission in 'temp/run'
+        run(corr_out, cmd_file, grader, student_id, res_path)
 
         os.chdir(work_path)
 
