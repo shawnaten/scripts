@@ -13,11 +13,12 @@ import os
 import re
 import shutil
 import tarfile
+import time
 import zipfile
 
 from difflib import unified_diff
 from functools import partial
-from subprocess import check_output, STDOUT, CalledProcessError, TimeoutExpired
+from subprocess import check_output, STDOUT, CalledProcessError, SubprocessError
 
 # Various directories for output
 TEMP_DIR = 'temp'
@@ -26,11 +27,14 @@ RUN_DIR = 'run'
 
 # Name strings for student files
 INFO_FILE = 'info-{0}.txt'
-OUTPUT_FILE = 'out-{0}.txt'
+OUTPUT_RAW_FILE = 'raw-out-{0}.txt'
+OUTPUT_COND_FILE = 'cond-out-{0}.txt'
 GRADING_FILE = 'grading-{0}.txt'
 DIFF_FILE = 'diff-{0}.diff'
 PRINT_FILE = 'prints-{0}.txt'
-COND_CORR_FILE = 'condensed_output.txt'
+COND_CORR_FILE = 'condensed-output.txt'
+ERR_FILE = 'errors.txt'
+RUN_FILE = '{0}-run.txt'
 
 # REs to identity and rename things
 INFO_FILE_RE = re.compile(r'.+_attempt_[0-9-]{19}\.txt')
@@ -39,7 +43,7 @@ ORIG_FILE_RE = re.compile(r'^\tOriginal filename: (.+)$')
 FILE_RE = re.compile(r'^\tFilename: (.+)$')
 
 
-open_utf8 = partial(open, encoding='utf-8', errors='replace')
+open_utf8 = partial(open, encoding='utf-8', errors='replace') # pylint: disable=C0103
 
 
 def collapse_whitespace(lines):
@@ -71,7 +75,7 @@ def find_output_calls(lines):
     return matches
 
 
-def get_args():
+def get_args(root):
     """Create arg parser, parse and return them."""
 
     parser = argparse.ArgumentParser(
@@ -114,7 +118,15 @@ def get_args():
         help='ID for student you want to regrade.'
     )
 
-    return parser.parse_args()
+    args = parser.parse_args()
+
+    args.directory = os.path.join(root, args.directory)
+    args.zipfile = os.path.join(args.directory, args.zipfile)
+    args.resources = os.path.join(root, args.resources)
+    args.commands = os.path.join(root, args.commands)
+    args.correct_output = os.path.join(root, args.correct_output)
+
+    return args
 
 
 def glob_commands(lines):
@@ -136,17 +148,29 @@ def glob_commands(lines):
     return commands
 
 
-def print_err(err, stud_id, gfile):
-    """Print error to stdout and grading file."""
-
-    print('!!! ({0}) {1}'.format(stud_id, str(err)))
-    print('!!! ({0}) {1}'.format(stud_id, str(err)), file=gfile)
-
-
-def run(corr_out, cmds, rpath):
+def run(args, run_file):
     """Compiles and runs code in temp directory."""
 
     stud_id = os.path.basename(os.getcwd())
+
+    with open_utf8(GRADING_FILE.format(stud_id), 'w') as mfile:
+        mfile.writelines([
+            'Grading for {0}.\n\n'.format(stud_id),
+            'Score: \n',
+            'Grader: {0}\n'.format(os.getenv('GRADER', '')),
+        ])
+
+    run_setup_temp(args)
+    cheat_check()
+    output = run_commands(args, run_file)
+    run_diff(args, output)
+
+    if output:
+        shutil.rmtree(TEMP_DIR)
+
+
+def run_setup_temp(args):
+    """Create temp directory and copy student and resource files into it."""
 
     # Going to run submission in temp subdirectory
     if os.path.exists(TEMP_DIR):
@@ -154,79 +178,110 @@ def run(corr_out, cmds, rpath):
     os.mkdir(TEMP_DIR)
 
     # Copy default resources into temp directory
-    for fname in os.listdir(rpath):
-        shutil.copy(os.path.join(rpath, fname), os.path.join(TEMP_DIR, fname))
+    for fname in os.listdir(args.resources):
+        src = os.path.join(args.resources, fname)
+        dst = os.path.join(TEMP_DIR, fname)
+        shutil.copy(src, dst)
 
     # Copy student resources into temp directory
     fnames = (fname for fname in os.listdir('.') if os.path.isfile(fname))
     for fname in fnames:
-        shutil.copy(fname, os.path.join(TEMP_DIR, fname))
+        name, ext = os.path.splitext(fname)
+        if name in ('Makefile') or ext in ('.c', '.h'):
+            src = fname
+            dst = os.path.join(TEMP_DIR, fname)
+            shutil.copy(src, dst)
 
-    # Open grading and analysis files
-    gfile = open_utf8(GRADING_FILE.format(stud_id), 'w')
-    ofile = open_utf8(OUTPUT_FILE.format(stud_id), 'w')
-    pfile = open_utf8(PRINT_FILE.format(stud_id), 'w')
-    dfile = open_utf8(DIFF_FILE.format(stud_id), 'w')
 
-    print('Grading for {0}.'.format(stud_id), file=gfile)
+def cheat_check():
+    """Find output calls in source files to check for obvious cheating."""
 
-    # Find output calls in source files to check for obvious cheating.
-    # e.g. printf("LINE OF CORRECT OUTPUT");
+    stud_id = os.path.basename(os.getcwd())
+    prints_file = open_utf8(PRINT_FILE.format(stud_id), 'w')
+
     fnames = (fname for fname in os.listdir('.') if fname.endswith('.c'))
     for fname in fnames:
-        with open_utf8(fname) as source:
-            try:
-                lines = source.readlines()
-            except UnicodeDecodeError as err:
-                print_err(err, stud_id, gfile)
-                return
+        source_file = open_utf8(fname)
 
-            calls = find_output_calls(lines)
-            pfile.writelines(calls)
+        lines = source_file.readlines()
+
+        calls = find_output_calls(lines)
+        prints_file.writelines(calls)
+
+        source_file.close()
+
+
+def run_commands(args, run_file):
+    """Run commands using subprocess module."""
+
+    stud_id = os.path.basename(os.getcwd())
+    raw_file = open_utf8(OUTPUT_RAW_FILE.format(stud_id), 'w')
+
+    with open_utf8(args.commands) as commands_file:
+        commands = commands_file.readlines()
 
     os.chdir(TEMP_DIR)
 
     # Need to get absolute paths for binary files
-    commands = glob_commands(cmds)
+    commands = glob_commands(commands)
 
     output = []
-    for cmd in commands:
+    for command in commands:
         try:
-            out_bytes = check_output(
-                cmd,
-                stderr=STDOUT,
-                timeout=5
-            )
+            out_bytes = check_output(command, stderr=STDOUT, timeout=2)
             out_str = str(out_bytes, encoding='utf-8', errors='replace')
             output.extend(out_str.splitlines(keepends=True))
-        except (CalledProcessError, FileNotFoundError, TimeoutExpired) as err:
-            print_err(err, stud_id, gfile)
-            if isinstance(err, CalledProcessError):
-                print(str(err.output), file=gfile)
-            return
+        except SubprocessError as error:
+            print('💀 {0}'.format(stud_id), file=run_file)
+            print(str(error), file=raw_file)
 
-    print('', file=gfile)
-    print('Score: ', file=gfile)
-    print('Grader: {0}'.format(os.getenv('GRADER', '')), file=gfile)
+            # pylint: disable=E1101
+            if isinstance(error, CalledProcessError):
+                message = str(error.output, encoding='utf-8', errors='replace')
+                print(message, file=raw_file)
 
-    if output:
-        output = collapse_whitespace(output)
-        ofile.writelines(output)
-        diff = unified_diff(
-            corr_out,
-            output,
-            fromfile='correct',
-            tofile='student'
-        )
-        dfile.writelines(diff)
+            os.chdir('..')
+            return None
 
-    gfile.close()
-    ofile.close()
-    pfile.close()
+    print('✅ {0}'.format(stud_id), file=run_file)
     os.chdir('..')
-    shutil.rmtree(TEMP_DIR)
+    return output
 
 
+def run_diff(args, output):
+    """Create unified diff between student output and rubric."""
+
+    if not output:
+        return
+
+    stud_id = os.path.basename(os.getcwd())
+
+    raw_out_file = open_utf8(OUTPUT_RAW_FILE.format(stud_id), 'w')
+    cond_out_file = open_utf8(OUTPUT_COND_FILE.format(stud_id), 'w')
+    diff_file = open_utf8(DIFF_FILE.format(stud_id), 'w')
+
+    raw_out_file.writelines(output)
+    output = collapse_whitespace(output)
+    cond_out_file.writelines(output)
+
+    correct = get_correct_output(args)
+
+    diff = unified_diff(correct, output, fromfile='correct', tofile='student')
+
+    diff_file.writelines(diff)
+
+
+def get_correct_output(args):
+    """Get the correct output with spaces collapsed (simplifies diff)."""
+
+    with open_utf8(args.correct_output) as cofile:
+        output = cofile.readlines()
+    output = collapse_whitespace(output)
+    return output
+    # with open_utf8(COND_CORR_FILE, 'w') as ccofile:
+    #     ccofile.writelines(corr_out)
+
+# pylint: disable=R0912, R0914, R0915
 def main():
     """
     1. Unzip file from Blackboard
@@ -235,28 +290,20 @@ def main():
     4. Run commands.txt
     """
 
-    args = get_args()
+    args = get_args(os.getcwd())
 
     directory = os.path.abspath(args.directory)
-    rpath = os.path.abspath(args.resources)
-
-    with open_utf8(args.commands) as cfile:
-        cmds = cfile.readlines()
-
-    with open_utf8(args.correct_output) as cofile:
-        corr_out = cofile.readlines()
-        corr_out = collapse_whitespace(corr_out)
-        with open_utf8(COND_CORR_FILE, 'w') as ccofile:
-            ccofile.writelines(corr_out)
 
     os.chdir(directory)
+
+    run_file = open_utf8(RUN_FILE.format(int(time.time())), 'w')
 
     # Just rerun for single student
     if args.regrade:
         stud_id = args.regrade
         os.chdir(os.path.join(SUBS_DIR, stud_id))
-        run(corr_out, cmds, rpath)
-        exit()
+        run(args, run_file)
+        return
 
     archive = zipfile.ZipFile(args.zipfile, 'r')
 
@@ -342,9 +389,11 @@ def main():
                 shutil.rmtree(name)
 
         # Run submission in 'temp/run'
-        run(corr_out, cmds, rpath)
+        run(args, run_file)
 
         os.chdir(directory)
+
+    shutil.rmtree(TEMP_DIR)
 
 
 if __name__ == '__main__':
